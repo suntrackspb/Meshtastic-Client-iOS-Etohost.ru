@@ -1,0 +1,84 @@
+//
+//  SecureInput.swift
+//  Meshtastic
+//
+//  Copyright(c) Garth Vander Houwen 8/12/24.
+//
+
+import SwiftUI
+
+struct SecureInput: View {
+
+	private var idiom: UIUserInterfaceIdiom { UIDevice.current.userInterfaceIdiom }
+	@Binding private var text: String
+	@Binding private var isValid: Bool
+	private var title: String
+
+	// Local state to store the value of iSSecure, or optionally a binding
+	private var isSecureBinding: Binding<Bool>?
+	@State private var isSecureLocal: Bool = true
+
+	private var isSecure: Binding<Bool> {
+		// Use the binding if we have one, otherwise fallback to the local state variable
+		isSecureBinding ?? $isSecureLocal
+	}
+
+	init(_ title: String, text: Binding<String>, isValid: Binding<Bool>, isSecure: Binding<Bool>? = nil) {
+		self.title = title
+		self._text = text
+		self._isValid = isValid
+		self.isSecureBinding = isSecure
+	}
+
+	var body: some View {
+		ZStack(alignment: .trailing) {
+			Group {
+				if isSecure.wrappedValue {
+					SecureField(title, text: $text)
+						.font(idiom == .phone ? .caption : .callout)
+						.allowsTightening(true)
+						.monospaced()
+						.keyboardType(.alphabet)
+						.foregroundStyle(.tertiary)
+						.disableAutocorrection(true)
+				} else {
+					TextField(title, text: $text, axis: .vertical)
+						.font(idiom == .phone ? .caption : .callout)
+						.allowsTightening(true)
+						.monospaced()
+						.keyboardType(.alphabet)
+						.foregroundStyle(.tertiary)
+						.disableAutocorrection(true)
+						.textSelection(.enabled)
+						.lineLimit(...3)
+						.background(
+							RoundedRectangle(cornerRadius: 10.0)
+								.stroke(isValid ? Color.clear : Color.red, lineWidth: 2.0)
+						)
+				}
+			}.padding(.trailing, 36)
+
+			if !text.isEmpty {
+				Button(action: {
+					isSecure.wrappedValue.toggle()
+				}) {
+					Image(systemName: self.isSecure.wrappedValue ? "eye.slash" : "eye")
+						.accentColor(.secondary)
+						// The glyph alone is a small target, and the trailing padding
+						// belongs to the text field rather than to this button.
+						.frame(minWidth: 48, minHeight: 48)
+						.contentShape(Rectangle())
+				}.buttonStyle(BorderlessButtonStyle())
+				.accessibilityLabel(self.isSecure.wrappedValue ? String(localized: "Show password", comment: "VoiceOver label for the button that reveals a masked password field") : String(localized: "Hide password", comment: "VoiceOver label for the button that masks a revealed password field"))
+			}
+		}
+	}
+}
+
+#Preview {
+	List {
+		SecureInput("Password", text: .constant("s3cretP@ss"), isValid: .constant(true))
+		SecureInput("Invalid Key", text: .constant("short"), isValid: .constant(false))
+		SecureInput("Empty", text: .constant(""), isValid: .constant(true))
+	}
+}

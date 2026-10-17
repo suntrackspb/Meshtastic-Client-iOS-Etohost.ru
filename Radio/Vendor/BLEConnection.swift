@@ -1,0 +1,832 @@
+//
+//  BLEConnection.swift
+//  Meshtastic
+//
+//  Created by Jake Bordens on 7/10/25.
+//
+
+import Foundation
+@preconcurrency import CoreBluetooth
+import OSLog
+import MeshtasticProtobufs
+
+let meshtasticServiceCBUUID = CBUUID(string: "0x6BA1B218-15A8-461F-9FA8-5DCAE273EAFD")
+let TORADIO_UUID = CBUUID(string: "0xF75C76D2-129E-4DAD-A1DD-7866124401E7")
+let FROMRADIO_UUID = CBUUID(string: "0x2C55E69E-4993-11ED-B878-0242AC120002")
+let FROMNUM_UUID = CBUUID(string: "0xED9DA18C-A800-4F66-A670-AA7547E34453")
+let LOGRADIO_UUID = CBUUID(string: "0x5a3d6e49-06e6-4423-9944-e9de8cdf9547")
+
+extension CBCharacteristic {
+	
+	var meshtasticCharacteristicName: String {
+		switch self.uuid {
+		case TORADIO_UUID:
+			return "TORADIO"
+		case FROMRADIO_UUID:
+			return "FROMRADIO"
+		case FROMNUM_UUID:
+			return "FROMNUM"
+		case LOGRADIO_UUID:
+			return "LOGRADIO"
+		default:
+			return "UNKNOWN (\(self.uuid.uuidString))"
+		}
+	}
+}
+
+actor BLEConnection: Connection {
+	let type = TransportType.ble
+	
+	var delegate: BLEConnectionDelegate
+	var peripheral: CBPeripheral
+	var central: CBCentralManager
+	private var needsDrain: Bool = false
+	private var isDraining: Bool = false
+	
+	fileprivate var TORADIO_characteristic: CBCharacteristic?
+	fileprivate var FROMRADIO_characteristic: CBCharacteristic?
+	fileprivate var FROMNUM_characteristic: CBCharacteristic?
+	fileprivate var LOGRADIO_characteristic: CBCharacteristic?
+	
+	private var connectionStreamContinuation: AsyncStream<ConnectionEvent>.Continuation?
+	
+	private var connectContinuation: CheckedContinuation<Void, Error>?
+	private var writeContinuations: WriteContinuationStore
+	private var readContinuations: [CheckedContinuation<Data, Error>]
+	private var writeReadinessContinuations: [CheckedContinuation<Void, Never>] = []
+
+	/// Notify characteristics whose subscription must confirm before the connect
+	/// process is considered complete. Subscribing to an encrypted characteristic is
+	/// what makes iOS present the pairing PIN sheet on a first-ever connection, so we
+	/// hold Step 1 open here until bonding actually completes (or fails) rather than
+	/// resolving optimistically and tearing the connection — and the sheet — down.
+	private var pendingNotifyConfirmations: Set<CBUUID> = []
+	private var isAwaitingNotifyConfirmation: Bool = false
+	
+	private var rssiTask: Task<Void, Never>?
+	
+	var isConnected: Bool { peripheral.state == .connected }
+	var transport: BLETransport?
+	
+	init(peripheral: CBPeripheral, central: CBCentralManager, transport: BLETransport) {
+		self.peripheral = peripheral
+		self.central = central
+		self.transport = transport
+		self.delegate = BLEConnectionDelegate(peripheral: peripheral)
+		self.writeContinuations = WriteContinuationStore()
+		self.readContinuations = []
+		self.delegate.setConnection(self)
+	}
+	
+	func disconnect(withError error: Error? = nil, shouldReconnect: Bool) async throws {
+		// If we're torn down while still waiting for the pairing subscription to confirm,
+		// bonding did not complete. Forget the paired hint so the next attempt uses the
+		// long pairing window instead of the fast reconnect timeout (self-heals a stale
+		// hint left by a bond the user removed via iOS Settings > Bluetooth).
+		if isAwaitingNotifyConfirmation {
+			isAwaitingNotifyConfirmation = false
+			pendingNotifyConfirmations.removeAll()
+			UserDefaults.forgetPairedPeripheral(peripheral.identifier)
+		}
+
+		// If we're torn down while the connect handshake is still suspended (e.g. the user
+		// cancels the pairing sheet, which iOS commonly delivers as a peripheral disconnect
+		// rather than a characteristic auth error), resume the connect continuation now so
+		// Step 1 fails fast instead of waiting out the full pairing timeout. Idempotent with
+		// the timeout/cancel paths since continueConnectionProcess nils the continuation.
+		if connectContinuation != nil {
+			continueConnectionProcess(throwing: error ?? AccessoryError.disconnected("Disconnected during connect"))
+		}
+
+		if peripheral.state == .connected {
+			if let characteristic = FROMRADIO_characteristic {
+				peripheral.setNotifyValue(false, for: characteristic)
+			}
+			if let characteristic = FROMNUM_characteristic {
+				peripheral.setNotifyValue(false, for: characteristic)
+			}
+			if let characteristic = LOGRADIO_characteristic {
+				peripheral.setNotifyValue(false, for: characteristic)
+			}
+		}
+		
+		await transport?.connectionDidDisconnect(fromPeripheral: peripheral)
+		
+		central.cancelPeripheralConnection(peripheral)
+		peripheral.delegate = nil
+				
+		writeContinuations.drainAll(throwing: AccessoryError.disconnected("Unknown error"))
+		writeReadinessContinuations.forEach { $0.resume() }
+		writeReadinessContinuations.removeAll()
+
+		while !readContinuations.isEmpty {
+			let readContinuation = readContinuations.removeFirst()
+			readContinuation.resume(throwing: AccessoryError.disconnected("Unknown error"))
+		}
+
+		if let error {
+			// Inform the AccessoryManager of the error and intent to reconnect
+			if shouldReconnect {
+				if let cbError = error as? CBError {
+					connectionStreamContinuation?.yield(.error(AccessoryError.coreBluetoothError(cbError)))
+				} else if let attError = error as? CBATTError {
+					connectionStreamContinuation?.yield(.error(AccessoryError.coreBluetoothATTError(attError)))
+				} else {
+					connectionStreamContinuation?.yield(.error(error))
+				}
+			} else {
+				if let cbError = error as? CBError {
+					connectionStreamContinuation?.yield(.errorWithoutReconnect(AccessoryError.coreBluetoothError(cbError)))
+				} else if let attError = error as? CBATTError {
+					connectionStreamContinuation?.yield(.errorWithoutReconnect(AccessoryError.coreBluetoothATTError(attError)))
+				} else {
+					connectionStreamContinuation?.yield(.errorWithoutReconnect(error))
+				}
+			}
+		} else {
+			connectionStreamContinuation?.yield(.disconnected(shouldReconnect: shouldReconnect))
+		}
+
+		connectionStreamContinuation?.finish()
+		connectionStreamContinuation = nil
+		
+		rssiTask?.cancel()
+		rssiTask = nil
+	}
+	
+	func startDrainPendingPackets() throws {
+		guard isConnected else {
+			throw AccessoryError.ioFailed("Not connected")
+		}
+		needsDrain = true
+		if !isDraining {
+			Task {
+				isDraining = true
+				defer { isDraining = false }
+				while needsDrain {
+					needsDrain = false
+					do {
+						try await drainPendingPackets()
+					} catch {
+						// Handle or log error as needed; for now, just continue to allow retry on next notification
+					}
+				}
+			}
+		}
+	}
+	
+	func drainPendingPackets() async throws {
+		guard isConnected else {
+			throw AccessoryError.ioFailed("Not connected")
+		}
+		repeat {
+			let data: Data
+			do {
+				data = try await read()
+			} catch {
+				// Transport-level read error — disconnect and allow reconnect
+				try? await self.disconnect(withError: error, shouldReconnect: true)
+				throw error
+			}
+
+			if data.count == 0 {
+				break
+			}
+
+			switch FromRadioDecoder.classify(data) {
+			case .decoded(let decodedInfo):
+				connectionStreamContinuation?.yield(.data(decodedInfo))
+			case .skipInvalidUTF8(let error):
+				// A string field failed UTF-8 validation; skip this frame and keep draining
+				// rather than dropping the connection over one unparseable field.
+				Logger.transport.error("⚠️ [BLE] Skipping FromRadio frame with invalid UTF-8 (\(data.count) bytes): \(error, privacy: .public)")
+			case .failed(let error):
+				// Other decode errors are likely transport/framing issues.
+				do {
+					try await self.disconnect(withError: error, shouldReconnect: true)
+				} catch let disconnectError {
+					Logger.transport.error("⚠️ [BLE] Failed to disconnect after FromRadio decode failure: \(disconnectError)")
+				}
+				throw error
+			}
+		} while true
+	}
+
+	func didReceiveLogMessage(_ logMessage: String) {
+		self.connectionStreamContinuation?.yield(.logMessage(logMessage))
+	}
+	
+	func didUpdateRssi(_ rssi: Int) {
+		self.connectionStreamContinuation?.yield(.rssiUpdate(rssi))
+	}
+	
+	func getPacketStream() -> AsyncStream<ConnectionEvent> {
+		// Bounded like TCPConnection's stream: drop the oldest events under sustained overload
+		// instead of queueing them without limit. BLE can't reach rates that fill this in
+		// practice; the bound is a backstop so no transport can balloon memory.
+		AsyncStream<ConnectionEvent>(bufferingPolicy: .bufferingNewest(4096)) { continuation in
+			// Finish any previous stream so its consumer's `for await` loop terminates cleanly
+			// instead of hanging indefinitely on the abandoned continuation.
+			self.connectionStreamContinuation?.finish()
+			self.connectionStreamContinuation = nil
+			
+			continuation.onTermination = { [weak self] termination in
+				guard let self else { return }
+				guard case .cancelled = termination else { return }
+				Task {
+					try await self.disconnect(withError: AccessoryError.eventStreamCancelled, shouldReconnect: true)
+				}
+			}
+			self.connectionStreamContinuation = continuation
+		}
+	}
+	
+	func discoverServices() async throws {
+		try await withCheckedThrowingContinuation { cont in
+			self.connectContinuation = cont
+			peripheral.discoverServices([meshtasticServiceCBUUID])
+		}
+	}
+	
+	func connect() async throws -> AsyncStream<ConnectionEvent> {
+		do {
+			// Make sure we're connected
+			guard self.peripheral.state == .connected else {
+				throw AccessoryError.ioFailed("BLE peripheral not connected")
+			}
+			
+			return try await withTaskCancellationHandler {
+				try await discoverServices()
+				startRSSITask()
+				return self.getPacketStream()
+			} onCancel: {
+				Task {
+					await self.continueConnectionProcess(throwing: CancellationError())
+					await self.notifyTransportOfDisconnect()
+				}
+			}
+		} catch {
+			// Before we throw, let the transport know we didn't successfully connect
+			await self.notifyTransportOfDisconnect()
+			throw error
+		}
+	}
+	
+	private func continueConnectionProcess(throwing error: Error? = nil) {
+		if let error {
+			self.connectContinuation?.resume(throwing: error)
+		} else {
+			self.connectContinuation?.resume()
+		}
+		self.connectContinuation = nil
+	}
+	
+	private func notifyTransportOfDisconnect() async {
+		await transport?.connectionDidDisconnect(fromPeripheral: peripheral)
+	}
+	
+	func startRSSITask() {
+		if let task = self.rssiTask {
+			task.cancel()
+		}
+		self.rssiTask = Task { [weak self] in
+			guard let self else { return }
+			do {
+				while !Task.isCancelled {
+					try await Task.sleep(for: .seconds(10))
+					await self.requestRSSIRead()
+				}
+			} catch {
+				
+			}
+		}
+	}
+	
+	private func requestRSSIRead() {
+		peripheral.readRSSI()
+	}
+}
+
+// MARK: - CBPeripheral delegate event handling & I/O
+extension BLEConnection {
+	
+	func didDiscoverServices(error: Error? ) {
+		if let error = error {
+			self.continueConnectionProcess(throwing: error)
+			return
+		}
+		
+		guard let services = peripheral.services else {
+			self.continueConnectionProcess(throwing: AccessoryError.discoveryFailed("No services found"))
+			return
+		}
+		
+		var foundMeshtasticService = false
+		for service in services where service.uuid == meshtasticServiceCBUUID {
+			foundMeshtasticService = true
+			peripheral.discoverCharacteristics([TORADIO_UUID, FROMRADIO_UUID, FROMNUM_UUID, LOGRADIO_UUID], for: service)
+			Logger.transport.info("🛜  [BLE] Service for Meshtastic discovered by \(self.peripheral.name ?? "Unknown", privacy: .public)")
+		}
+		
+		if !foundMeshtasticService {
+			self.continueConnectionProcess(throwing: AccessoryError.discoveryFailed("Meshtastic service not found"))
+		}
+	}
+	
+	func didDiscoverCharacteristicsFor(service: CBService, error: Error?) {
+		if let error = error {
+			self.continueConnectionProcess(throwing: error)
+			return
+		}
+		guard let characteristics = service.characteristics else {
+			self.continueConnectionProcess(throwing: AccessoryError.discoveryFailed("No characteristics"))
+			return
+		}
+		
+		for characteristic in characteristics {
+			switch characteristic.uuid {
+			case TORADIO_UUID:
+				Logger.transport.info("🛜 [BLE] did discover TORADIO characteristic for Meshtastic by \(self.peripheral.name ?? "Unknown", privacy: .public)")
+				TORADIO_characteristic = characteristic
+				// Record the MTU-derived write ceiling once, at discovery. If this is ~20B the MTU
+				// negotiation did not take, and every admin message larger than a trivial one will fail.
+				Logger.transport.error(
+					"🛜 [BLE] ToRadio write limits — withResponse: \(self.peripheral.maximumWriteValueLength(for: .withResponse), privacy: .public)B, withoutResponse: \(self.peripheral.maximumWriteValueLength(for: .withoutResponse), privacy: .public)B"
+				)
+				
+			case FROMRADIO_UUID:
+				Logger.transport.info("🛜 [BLE] did discover FROMRADIO characteristic for Meshtastic by \(self.peripheral.name ?? "Unknown", privacy: .public)")
+				FROMRADIO_characteristic = characteristic
+				self.peripheral.setNotifyValue(true, for: characteristic)
+				
+			case FROMNUM_UUID:
+				Logger.transport.info("🛜 [BLE] did discover FROMNUM (Notify) characteristic for Meshtastic by \(self.peripheral.name ?? "Unknown", privacy: .public)")
+				FROMNUM_characteristic = characteristic
+				self.peripheral.setNotifyValue(true, for: characteristic)
+				
+			case LOGRADIO_UUID:
+				Logger.transport.info("🛜 [BLE] did discover LOGRADIO (Notify) characteristic for Meshtastic by \(self.peripheral.name ?? "Unknown", privacy: .public)")
+				LOGRADIO_characteristic = characteristic
+				self.peripheral.setNotifyValue(true, for: characteristic)
+				
+			default:
+				Logger.transport.info("🛜 [BLE] did discover unsupported \(characteristic.uuid) characteristic for Meshtastic by \(self.peripheral.name ?? "Unknown", privacy: .public)")
+			}
+		}
+		
+		if TORADIO_characteristic != nil && FROMRADIO_characteristic != nil && FROMNUM_characteristic != nil {
+			// Gate connect-completion on the FROMNUM notify subscription confirming.
+			// FROMNUM is always notify-capable and encrypted, so its confirmation is the
+			// definitive "bonding succeeded" signal on a first-ever (PIN) connection. We
+			// wait for the CoreBluetooth callback (which does not fire until the user
+			// dismisses the pairing sheet) instead of resolving immediately.
+			Logger.transport.info("🛜 [BLE] characteristics ready, awaiting FROMNUM subscription confirmation")
+			pendingNotifyConfirmations = [FROMNUM_UUID]
+			isAwaitingNotifyConfirmation = true
+		} else {
+			Logger.transport.info("🛜 [BLE] Missing required characteristics")
+			self.continueConnectionProcess(throwing: AccessoryError.discoveryFailed("Missing required characteristics"))
+		}
+	}
+	
+	func didUpdateValueFor(characteristic: CBCharacteristic, error: Error?) {
+		if let error = error {
+			if characteristic.uuid == FROMRADIO_UUID {
+				Logger.transport.debug("🛜 [BLE] Error updating value for \(characteristic.meshtasticCharacteristicName, privacy: .public): \(error)")
+				if !readContinuations.isEmpty {
+					let readContinuation = self.readContinuations.removeFirst()
+					readContinuation.resume(throwing: error)
+				}
+			}
+			Task { try await self.handlePeripheralError(error: error) }
+			return
+		}
+		Logger.transport.debug("🛜 [BLE] Did update value for \(characteristic.meshtasticCharacteristicName, privacy: .public)=\(characteristic.value ?? Data(), privacy: .public)")
+
+		guard let value = characteristic.value else { return }
+		
+		switch characteristic.uuid {
+		case FROMRADIO_UUID:
+			if !readContinuations.isEmpty {
+				let readContinuation = self.readContinuations.removeFirst()
+				readContinuation.resume(returning: value)
+			}
+		case FROMNUM_UUID:
+			try? startDrainPendingPackets()
+			
+		case LOGRADIO_UUID:
+			if let value = characteristic.value,
+			   let logRecord = try? LogRecord(serializedBytes: value) {
+				self.didReceiveLogMessage(logRecord.stringRepresentation)
+			}
+			
+		default:
+			break
+		}
+	}
+	
+	func didUpdateNotificationState(characteristic: CBCharacteristic, error: Error?) {
+		if let error {
+			Logger.transport.error("🛜 [BLE] Notify state error for \(characteristic.meshtasticCharacteristicName, privacy: .public): \(error, privacy: .public)")
+			guard case .endConnection = Self.notifyFailure(
+				error: error,
+				isAwaitingConfirmation: isAwaitingNotifyConfirmation,
+				gatesConnect: pendingNotifyConfirmations.contains(characteristic.uuid)
+			) else { return }
+
+			isAwaitingNotifyConfirmation = false
+			pendingNotifyConfirmations.removeAll()
+			let reported = Self.bondLostError(for: peripheral.identifier, error: error)
+			// Torn down while still waiting for the subscription means bonding did not
+			// complete, so the hint goes either way. `bondLostError` reads it first.
+			UserDefaults.forgetPairedPeripheral(peripheral.identifier)
+			// Then hand it to the same classifier every other peripheral error goes through.
+			// It decides whether the error is worth reconnecting for — none of these are —
+			// tears the link down, and resumes the suspended connect with the error.
+			// Resuming the connect directly from here skipped all of that, and a connect step
+			// retries by default, so a pairing failure came back as "Too Many Retries" with
+			// the reason discarded.
+			Task { try? await self.handlePeripheralError(error: reported) }
+			return
+		}
+
+		guard isAwaitingNotifyConfirmation else { return }
+		pendingNotifyConfirmations.remove(characteristic.uuid)
+		guard pendingNotifyConfirmations.isEmpty else { return }
+
+		// Subscription confirmed — bonding (if any) completed successfully.
+		isAwaitingNotifyConfirmation = false
+		// Remember this bond so future reconnects use the fast timeouts.
+		UserDefaults.rememberPairedPeripheral(peripheral.identifier)
+		Logger.transport.info("🛜 [BLE] FROMNUM subscription confirmed, connection ready")
+		self.continueConnectionProcess()
+
+		// Read initial RSSI on ready
+		peripheral.readRSSI()
+	}
+
+	/// Whether a notify-state error indicates a BLE pairing/bonding failure (wrong or
+	/// cancelled PIN) rather than a benign per-characteristic issue such as a
+	/// characteristic that does not support notifications.
+	static func isPairingFailure(_ error: Error) -> Bool {
+		if let attError = error as? CBATTError {
+			switch attError.code {
+			case .insufficientAuthentication, .insufficientEncryption, .insufficientAuthorization:
+				return true
+			default:
+				return false
+			}
+		}
+		if let cbError = error as? CBError {
+			return cbError.code == .encryptionTimedOut || cbError.code == .peerRemovedPairingInformation
+		}
+		return false
+	}
+
+	func didWriteValueFor(characteristic: CBCharacteristic, error: Error?) {
+		guard characteristic.uuid == TORADIO_UUID else {
+			Logger.transport.error("🛜 [BLE] didWriteValueFor a characteristic other than TORADIO_UUID.  Should not happen!")
+			return
+		}
+		guard let entry = writeContinuations.removeFirst() else {
+			Logger.transport.debug("🛜 [BLE] didWriteValueFor with no waiting continuations")
+			return
+		}
+		guard let continuation = entry.continuation else {
+			// This is the callback for a canceled write. The tombstone preserves FIFO
+			// ordering so it cannot consume the next write's continuation.
+			return
+		}
+		
+		if let error = error {
+			Logger.transport.error("🛜 [BLE] Did write for \(characteristic.meshtasticCharacteristicName, privacy: .public) with error \(error, privacy: .public)")
+			continuation.resume(throwing: error)
+			// A radio momentarily out of buffers is not a broken link: `send` retries it. Escalating here
+			// would tear the session down first and abort whatever operation was in flight, which is how a
+			// single refused write used to end an entire config import.
+			if (error as? CBATTError)?.code == .insufficientResources {
+				return
+			}
+			Task { try await self.handlePeripheralError(error: error) }
+		} else {
+			#if DEBUG
+			// Too much logging to report every write.
+			Logger.transport.error("🛜 [BLE] Did write for \(characteristic.meshtasticCharacteristicName, privacy: .public)")
+			#endif
+			continuation.resume()
+		}
+	}
+	
+	func didReadRSSI(RSSI: NSNumber, error: Error?) {
+		if let error = error {
+			Logger.transport.error("🛜 [BLE] Error reading RSSI: \(error.localizedDescription)")
+			return
+		}
+		connectionStreamContinuation?.yield(.rssiUpdate(RSSI.intValue))
+	}
+	
+	func send(_ data: ToRadio) async throws {
+		guard let characteristic = TORADIO_characteristic, isConnected else {
+			throw AccessoryError.ioFailed("Not connected or characteristic not found")
+		}
+		guard let binaryData = try? data.serializedData() else {
+			throw AccessoryError.ioFailed("Failed to serialize data")
+		}
+		guard characteristic.properties.contains(.write) ||
+				characteristic.properties.contains(.writeWithoutResponse) else {
+			throw AccessoryError.ioFailed("Characteristic does not support write")
+		}
+		
+		let writeType: CBCharacteristicWriteType = characteristic.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
+		// Retry a radio that is momentarily out of buffers. CBATTError.insufficientResources is the
+		// peripheral failing to allocate for this one write, not a broken link, and it shows up on larger
+		// admin messages (set_owner, config sets) while small ones go through. Without this a single
+		// transient failure aborts whatever operation was in flight.
+		for attempt in 0..<Self.writeAttemptLimit {
+			// A cancelled send must not put another write on the wire.
+			try Task.checkCancellation()
+			do {
+				try await performWrite(binaryData, to: characteristic, type: writeType)
+				return
+			} catch let attError as CBATTError where attError.code == .insufficientResources {
+				switch Self.refusedWriteAction(afterAttempt: attempt) {
+				case .giveUp:
+					Logger.transport.error("🛜 [BLE] write of \(binaryData.count, privacy: .public)B still refused after \(Self.writeAttemptLimit, privacy: .public) attempts")
+					throw attError
+				case .retry(let backoff):
+					Logger.transport.error("🛜 [BLE] radio out of buffers for a \(binaryData.count, privacy: .public)B write; retry \(attempt + 1, privacy: .public)")
+					// Not `try?`: a cancellation during the backoff must propagate rather than fall
+					// through into another write.
+					try await Task.sleep(for: backoff)
+				}
+			}
+		}
+	}
+
+	/// What to do after a write comes back refused for buffers.
+	///
+	/// There is no case here for tearing the link down, and that is the point. A refused write
+	/// says the radio could not allocate a buffer for this one payload; it says nothing about
+	/// the link, which is still up and still carrying smaller writes. Escalating on the last
+	/// attempt used to cycle the connection, and a connection that cycles is worse than a write
+	/// that fails: a caller can retry a write, while a reconnect restarts config exchange and
+	/// rewrites every view watching the connection.
+	///
+	/// Pure, so the retry count and the backoff schedule can be tested without a peripheral —
+	/// the same reason `shouldReconnect(after:)` below is pure.
+	enum RefusedWriteAction: Equatable {
+		/// Wait this long, then write again.
+		case retry(backoff: Duration)
+		/// Attempts are spent. Throw to the caller and leave the link alone.
+		case giveUp
+	}
+
+	static func refusedWriteAction(afterAttempt attempt: Int) -> RefusedWriteAction {
+		guard attempt + 1 < writeAttemptLimit else { return .giveUp }
+		return .retry(backoff: .milliseconds(120 * (attempt + 1)))
+	}
+
+	/// Total number of times a single write is attempted when the radio reports it is out of
+	/// buffers: the initial write plus three retries, backing off 120/240/360ms between them.
+	static let writeAttemptLimit = 4
+
+	private func performWrite(
+		_ binaryData: Data,
+		to characteristic: CBCharacteristic,
+		type writeType: CBCharacteristicWriteType
+	) async throws {
+		// Log the payload size against the negotiated write limit so an over-limit write is
+		// distinguishable from the radio simply being out of buffers — both surface as an opaque
+		// "resources are insufficient" at the peripheral.
+		let limit = peripheral.maximumWriteValueLength(for: writeType)
+		if binaryData.count > limit {
+			Logger.transport.error(
+				"🛜 [BLE] ToRadio write \(binaryData.count, privacy: .public)B EXCEEDS negotiated limit \(limit, privacy: .public)B for \(writeType == .withResponse ? "withResponse" : "withoutResponse", privacy: .public) — expect an ATT failure"
+			)
+		} else {
+			// .error, not .debug/.info: only notice-and-above are persisted to OSLogStore, which is what
+			// the in-app log viewer reads. A .debug line here is invisible in the field.
+			Logger.transport.error(
+				"🛜 [BLE] ToRadio write \(binaryData.count, privacy: .public)B (limit \(limit, privacy: .public)B) type=\(writeType == .withResponse ? "withResponse" : "withoutResponse", privacy: .public)"
+			)
+		}
+
+		if writeType == .withoutResponse {
+			if !peripheral.canSendWriteWithoutResponse {
+				await waitForWriteReadiness()
+			}
+			try Task.checkCancellation()
+			peripheral.writeValue(binaryData, for: characteristic, type: writeType)
+			return
+		}
+
+		// Write-with-response: the continuation lives in a keyed store so the cancel
+		// handler and didWriteValueFor cannot double-resume. The cancel handler hops to
+		// the actor and no-ops if didWriteValueFor already consumed the continuation.
+		let writeID = UUID()
+		try await withTaskCancellationHandler {
+			try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+				writeContinuations.insert(id: writeID, continuation: continuation)
+				peripheral.writeValue(binaryData, for: characteristic, type: writeType)
+			}
+		} onCancel: {
+			Task { await self.cancelWrite(id: writeID) }
+		}
+	}
+
+	/// Resume and remove a single pending write continuation on cancellation.
+	/// No-ops if didWriteValueFor already consumed it — that is the expected race.
+	private func cancelWrite(id: UUID) {
+		guard let continuation = writeContinuations.cancel(id: id) else { return }
+		continuation.resume(throwing: CancellationError())
+	}
+
+	private func waitForWriteReadiness() async {
+		await withCheckedContinuation { continuation in
+			writeReadinessContinuations.append(continuation)
+		}
+	}
+
+	func peripheralIsReadyToSendWriteWithoutResponse() {
+		let continuations = writeReadinessContinuations
+		writeReadinessContinuations.removeAll()
+		continuations.forEach { $0.resume() }
+	}
+	
+	func read() async throws -> Data {
+		guard let FROMRADIO_characteristic else {
+			throw AccessoryError.ioFailed("No FROMRADIO_characteristic ")
+		}
+		let data: Data = try await withCheckedThrowingContinuation { newReadContinuation in
+			readContinuations.append(newReadContinuation)
+			peripheral.readValue(for: FROMRADIO_characteristic)
+		}
+		if data.isEmpty {
+			Logger.transport.debug("🛜 [BLE] Received empty data, ending drain operation.")
+		}
+		return data
+	}
+	
+	func handlePeripheralError(error: Error) async throws {
+		let shouldReconnect = Self.shouldReconnect(after: error)
+		logPeripheralError(error)
+
+		// Inform the active connection that there was an error and it should disconnect
+		try await self.disconnect(withError: error, shouldReconnect: shouldReconnect)
+	}
+
+	/// Whether an error is worth reconnecting for.
+	///
+	/// Three codes are: everything else is final. A pairing failure is one of the final
+	/// ones — the radio has thrown away a bond only the user can clear — and reconnecting on
+	/// it burns the connect step's retry budget and ends as "Too Many Retries" with the real
+	/// reason discarded. Pure so it can be tested without a peripheral.
+	static func shouldReconnect(after error: Error) -> Bool {
+		switch error {
+		case is CBATTError:
+			// No ATT error is worth reconnecting for, including `insufficientResources`. That one
+			// is the radio failing to allocate for a single write — observed on a Heltec V4
+			// (ESP32-S3/NimBLE), where writes of 8-33B succeed while a 104B set_owner is refused
+			// with an ATT MTU of 255 negotiated. The link is up either way, so cycling it fixes
+			// nothing and costs a full reconnect. `send` retries the write; if the retries are
+			// spent it throws, and the caller decides.
+			return false
+		case let cbError as CBError:
+			switch cbError.code {
+			// Happens when the node goes out of range or the shutdown or reset buttons are pressed,
+			// and when it reboots or shuts down intentionally via the firmware or app. Disconnect,
+			// show the error, and retry when it advertises again.
+			case .connectionTimeout, .peripheralDisconnected: // 6, 7
+				return true
+			default:
+				return false
+			}
+		default:
+			return false
+		}
+	}
+
+	/// What a notify-state error means for a connect still waiting on its subscription.
+	///
+	/// `.ignore` for a benign error on a characteristic the connect does not gate on — a
+	/// radio that does not support notifications on one of them must not fail an otherwise
+	/// good connect. A pairing failure counts wherever it lands, because an encryption
+	/// failure typically hits every subscription. Pure so it can be tested without a
+	/// peripheral.
+	enum NotifyFailure {
+		case ignore
+		case endConnection
+	}
+
+	static func notifyFailure(error: Error, isAwaitingConfirmation: Bool, gatesConnect: Bool) -> NotifyFailure {
+		guard isAwaitingConfirmation, gatesConnect || isPairingFailure(error) else { return .ignore }
+		return .endConnection
+	}
+
+	/// Reads the bond hint and clears it in one step, so the two cannot end up the wrong way
+	/// around: the answer depends on the hint that clearing destroys.
+	///
+	/// A radio that erased its pairing and a mistyped PIN arrive under the same Core
+	/// Bluetooth codes and need opposite advice — clear the pairing in Settings, or try the
+	/// PIN again. Having paired with this radio before is what separates them. Clearing the
+	/// hint also self-heals the connect timeout back to the long pairing window.
+	static func bondLostError(for peripheralID: UUID, error: Error) -> Error {
+		guard isPairingFailure(error) else { return error }
+		let hadBond = UserDefaults.isPairedPeripheral(peripheralID)
+		UserDefaults.forgetPairedPeripheral(peripheralID)
+		// Peer-removed-pairing is the radio saying outright that it dropped the bond — there is
+		// nothing to disambiguate, so it is a lost bond with or without the hint. Relying on the
+		// hint here made the classification one-shot: the first failure cleared it, and every
+		// retry after that saw a raw, retryable-looking error. Reconnecting can never fix this;
+		// only forgetting the device in iOS Settings can.
+		if let cbError = error as? CBError, cbError.code == .peerRemovedPairingInformation {
+			return AccessoryError.bondLost
+		}
+		return hadBond ? AccessoryError.bondLost : error
+	}
+
+	/// Whether a connect failure can never be fixed by trying again.
+	///
+	/// A lost bond needs the user to forget the device in iOS Settings > Bluetooth — every retry
+	/// re-fails the same way, and retrying it is the reconnect loop this exists to end. Pure so the
+	/// policy is testable without a peripheral.
+	static func terminatesConnectRetries(_ error: Error) -> Bool {
+		if case AccessoryError.bondLost = error { return true }
+		if let cbError = error as? CBError, cbError.code == .peerRemovedPairingInformation { return true }
+		return false
+	}
+
+	private func logPeripheralError(_ error: Error) {
+		switch error {
+		case let attError as CBATTError:
+			if attError.code == .insufficientResources {
+				Logger.transport.error("🛜 [BLEConnection] Radio out of buffers for this write (CBATTError \(attError.code.rawValue)); leaving the link up")
+			} else {
+				Logger.transport.error("🛜 [BLEConnection] Disconnected with CBATTError code: \(attError.code.rawValue) - \(attError.localizedDescription)")
+			}
+		case let cbError as CBError:
+			Logger.transport.error("🛜 [BLEConnection] Disconnected with CBError code: \(cbError.code.rawValue) - \(cbError.localizedDescription)")
+		case let otherError:
+			Logger.transport.error("🛜 [BLEConnection] Disconnected with non CBError or CBATTError: \(otherError.localizedDescription)")
+		}
+	}
+	
+	func appDidEnterBackground() {
+		if let task = self.rssiTask {
+			Logger.transport.info("🛜 [BLE] App is entering the background, suspending RSSI reports.")
+			task.cancel()
+			self.rssiTask = nil
+		}
+	}
+	
+	func appDidBecomeActive() {
+		if self.rssiTask == nil {
+			Logger.transport.info("🛜 [BLE] App is active, restarting RSSI reports.")
+			self.startRSSITask()
+		}
+	}
+}
+
+class BLEConnectionDelegate: NSObject, CBPeripheralDelegate {
+	private weak var connection: BLEConnection?
+	let peripheral: CBPeripheral
+		
+	init(peripheral: CBPeripheral) {
+		self.peripheral = peripheral
+		super.init()
+		peripheral.delegate = self
+	}
+	
+	func setConnection(_ connection: BLEConnection) {
+		self.connection = connection
+	}
+	
+	// MARK: CBPeripheralDelegate
+	func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+		Task { await connection?.didDiscoverServices(error: error) }
+	}
+	
+	func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+		Task { await connection?.didDiscoverCharacteristicsFor(service: service, error: error) }
+	}
+	
+	func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+		Task { await connection?.didUpdateValueFor(characteristic: characteristic, error: error) }
+	}
+	
+	func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+		Task { await connection?.didUpdateNotificationState(characteristic: characteristic, error: error) }
+	}
+	
+	func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+		Task { await connection?.didWriteValueFor(characteristic: characteristic, error: error) }
+	}
+
+	func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+		Task { await connection?.peripheralIsReadyToSendWriteWithoutResponse() }
+	}
+	
+	func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
+		Task { await connection?.didReadRSSI(RSSI: RSSI, error: error) }
+	}
+}

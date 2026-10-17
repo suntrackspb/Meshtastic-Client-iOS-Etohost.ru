@@ -1,0 +1,57 @@
+name: MeshMirror
+options:
+  bundleIdPrefix: ru.etohost
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+
+packages:
+  MeshtasticProtobufs:
+    path: MeshtasticProtobufs
+  CocoaMQTT:
+    url: https://github.com/emqx/CocoaMQTT
+    from: 2.0.0
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_TEAM: Q88GF8VYJF
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  MeshMirror:
+    type: application
+    platform: iOS
+    sources:
+      - path: .
+        excludes:
+          - MeshtasticProtobufs/**
+          - build/**
+          - project.yml
+          - README.md
+          - LICENSE
+          - "*.xcodeproj/**"
+    dependencies:
+      - package: MeshtasticProtobufs
+      - package: CocoaMQTT
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ru.etohost.meshmirror
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: MeshMirror
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription: "Bluetooth нужен для подключения к ноде Meshtastic."
+        INFOPLIST_KEY_NSLocationWhenInUseUsageDescription: "Координаты телефона нужны, чтобы задать ноде фиксированную позицию."
+        INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription: "Пока нода подключена, геолокация в фоне не даёт iOS разорвать соединение."
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Локальная сеть нужна для подключения к ноде Meshtastic по Wi-Fi."
+    info:
+      path: Info.plist
+      properties:
+        UIBackgroundModes: [bluetooth-central, location]
+        NSBonjourServices: [_meshtastic._tcp]
+        CFBundleAllowMixedLocalizations: true

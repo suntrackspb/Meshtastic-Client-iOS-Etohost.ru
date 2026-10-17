@@ -1,0 +1,11 @@
+# Сборка
+build/
+DerivedData/
+*.xcodeproj/
+xcuserdata/
+.DS_Store
+
+
+# Локальные инструменты
+.claude/
+.codegraph/
