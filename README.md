@@ -1,4 +1,4 @@
-# MeshMirror
+# EtohostMesh
 
 iOS-клиент Meshtastic с зеркалом сети через [mesh-mirror](https://m.etohost.ru).
 
@@ -13,7 +13,7 @@ iOS-клиент Meshtastic с зеркалом сети через [mesh-mirror
 
 ```sh
 xcodegen
-open MeshMirror.xcodeproj
+open EtohostMesh.xcodeproj
 ```
 
 В `project.yml` укажите свой `DEVELOPMENT_TEAM` для подписи.
@@ -22,7 +22,7 @@ open MeshMirror.xcodeproj
 
 Часть кода (транспорт BLE/TCP, экраны настроек, MQTT-прокси и др.) взята из
 [Meshtastic-Apple](https://github.com/meshtastic/Meshtastic-Apple), который распространяется
-под GPL v3. Поэтому MeshMirror целиком распространяется под
+под GPL v3. Поэтому EtohostMesh целиком распространяется под
 [GNU General Public License v3.0](LICENSE).
 
 Meshtastic® — зарегистрированный товарный знак Meshtastic LLC. Проект не связан с Meshtastic LLC.

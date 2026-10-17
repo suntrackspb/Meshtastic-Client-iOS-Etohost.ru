@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct MeshMirrorApp: App {
+struct EtohostMeshApp: App {
     @State private var chat: ChatStore
     @State private var nodes: NodesStore
     @State private var direct: DirectStore

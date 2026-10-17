@@ -1,4 +1,4 @@
-name: MeshMirror
+name: EtohostMesh
 options:
   bundleIdPrefix: ru.etohost
   deploymentTarget:
@@ -22,27 +22,29 @@ settings:
     CODE_SIGN_STYLE: Automatic
 
 targets:
-  MeshMirror:
+  EtohostMesh:
     type: application
     platform: iOS
     sources:
-      - path: .
-        excludes:
-          - MeshtasticProtobufs/**
-          - build/**
-          - project.yml
-          - README.md
-          - LICENSE
-          - "*.xcodeproj/**"
+      - path: App
+      - path: Chat
+      - path: Direct
+      - path: Mirror
+      - path: Model
+      - path: Nodes
+      - path: Radio
+      - path: Resources
+      - path: Settings
     dependencies:
       - package: MeshtasticProtobufs
       - package: CocoaMQTT
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ru.etohost.meshmirror
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         TARGETED_DEVICE_FAMILY: "1"
         GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_CFBundleDisplayName: MeshMirror
+        INFOPLIST_KEY_CFBundleDisplayName: EtohostMesh
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
         INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription: "Bluetooth нужен для подключения к ноде Meshtastic."
