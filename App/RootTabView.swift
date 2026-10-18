@@ -3,6 +3,7 @@ import SwiftUI
 struct RootTabView: View {
     @Environment(MirrorRealtime.self) private var mirror
     @Environment(NodesStore.self) private var nodes
+    @Environment(RadioManager.self) private var radio
     @Environment(DirectStore.self) private var direct
     @Environment(AppRouter.self) private var router
     @Environment(\.scenePhase) private var scenePhase
@@ -33,6 +34,7 @@ struct RootTabView: View {
             switch phase {
             case .active:
                 mirror.resume()
+                radio.appDidBecomeActive()
                 Task { await nodes.refreshFromMirror() }
             default:
                 break

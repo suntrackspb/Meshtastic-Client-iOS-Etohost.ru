@@ -72,6 +72,8 @@ final class RadioManager {
     @ObservationIgnored private var pendingSlots: [Channel] = []
     @ObservationIgnored private var publicKeys: [UInt32: Data] = [:]
     @ObservationIgnored private var userDisconnected = false
+    /// Когда от ноды пришёл последний пакет — для таймаута heartbeat.
+    @ObservationIgnored private var lastReceived = Date.distantPast
 
     init(chat: ChatStore, nodes: NodesStore, direct: DirectStore) {
         self.chat = chat
@@ -120,13 +122,21 @@ final class RadioManager {
                 discovered.append(device)
             }
             // Автоподключение к последней ноде, когда она появилась в эфире.
-            if device.id == Self.preferredDevice?.id, state == .disconnected, !userDisconnected {
+            if device.id == Self.preferredDevice?.id, canAutoConnect, !userDisconnected {
                 Task { try? await connect(to: device) }
             }
         case .deviceLost(let id):
             discovered.removeAll { $0.id == id }
         case .deviceReportedRssi(let id, let rssi):
             if let i = discovered.firstIndex(where: { $0.id == id }) { discovered[i].rssi = rssi }
+        }
+    }
+
+    /// Автоподключение при обнаружении: и после разрыва, и после неудачной попытки.
+    private var canAutoConnect: Bool {
+        switch state {
+        case .disconnected, .failed: reconnectTask == nil
+        default: false
         }
     }
 
@@ -139,6 +149,13 @@ final class RadioManager {
     func connect(to device: Device, using existing: (any Connection)? = nil) async throws {
         userDisconnected = false
         reconnectTask?.cancel()
+        reconnectTask = nil
+        try await performConnect(to: device, using: existing)
+    }
+
+    /// Само подключение. Не трогает reconnectTask: его вызывает и цикл переподключения,
+    /// и раньше `connect` отменял сам этот цикл — попытка падала с CancellationError.
+    private func performConnect(to device: Device, using existing: (any Connection)? = nil) async throws {
         await teardown()
         state = .connecting(device.name)
         do {
@@ -218,7 +235,10 @@ final class RadioManager {
         heartbeatTask?.cancel()
         eventTask = nil
         heartbeatTask = nil
+        // Закрываем сокет: прошивка держит одного TCP-клиента, брошенное соединение мешает новому.
+        let old = connection
         connection = nil
+        try? await old?.disconnect(withError: nil, shouldReconnect: false)
         connectedDevice = nil
     }
 
@@ -229,14 +249,19 @@ final class RadioManager {
         }
         reconnectTask?.cancel()
         reconnectTask = Task { [weak self] in
-            for attempt in 1...10 {
-                guard let self, !Task.isCancelled else { return }
+            var attempt = 0
+            // Пробуем, пока пользователь сам не отключится: нода может перезагружаться долго.
+            while !Task.isCancelled {
+                attempt += 1
+                guard let self else { return }
                 self.state = .reconnecting(reason, attempt: attempt)
-                try? await Task.sleep(for: .seconds(min(30, 2 * attempt)))
+                try? await Task.sleep(for: .seconds(attempt == 1 ? 1 : min(15, 2 * attempt)))
                 if Task.isCancelled { return }
-                if (try? await self.connect(to: device)) != nil { return }
+                if (try? await self.performConnect(to: device)) != nil {
+                    self.reconnectTask = nil
+                    return
+                }
             }
-            self?.state = .failed(reason)
         }
     }
 
@@ -248,13 +273,60 @@ final class RadioManager {
         try await connection?.send(toRadio)
     }
 
+    /// Как в Meshtastic-Apple: heartbeat раз в 15 с, если линия молчит. С прошивки 2.7.4 нода
+    /// отвечает на него; нет ни одного пакета 5 с — соединение мёртвое, рвём и переподключаемся.
     private func startHeartbeat() {
+        heartbeatTask?.cancel()
         heartbeatTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(15))
-                try? await self?.sendHeartbeat()
+                guard let self, !Task.isCancelled else { return }
+                if Date().timeIntervalSince(self.lastReceived) < 15 { continue }
+                await self.probeConnection()
             }
         }
+    }
+
+    /// Проверить, жива ли линия: heartbeat и ожидание любого ответа.
+    func probeConnection() async {
+        guard let connection, isConnected || isConfiguring else { return }
+        let sentAt = Date()
+        do {
+            try await sendHeartbeat()
+        } catch {
+            try? await connection.disconnect(withError: AccessoryError.timeout, shouldReconnect: true)
+            return
+        }
+        guard supportsHeartbeatResponse else { return }
+        try? await Task.sleep(for: .seconds(5))
+        guard (self.connection as AnyObject?) === (connection as AnyObject), lastReceived < sentAt else { return }
+        Logger.radio.error("Heartbeat timeout")
+        try? await connection.disconnect(withError: AccessoryError.timeout, shouldReconnect: true)
+    }
+
+    private var isConfiguring: Bool { if case .configuring = state { true } else { false } }
+
+    private var supportsHeartbeatResponse: Bool {
+        guard let version = firmwareVersion else { return true }
+        let parts = version.split(separator: ".").prefix(3).map { Int($0.prefix { $0.isNumber }) ?? 0 }
+        return parts.lexicographicallyPrecedes([2, 7, 4]) == false
+    }
+
+    /// Возврат в приложение: сразу проверить линию, а если связь потеряна — переподключиться без пауз.
+    func appDidBecomeActive() {
+        if connection != nil {
+            Task { await probeConnection() }
+        } else if !userDisconnected, Self.preferredDevice != nil {
+            switch state {
+            case .failed, .reconnecting, .disconnected:
+                // Не ждём паузы цикла — пробуем сразу.
+                reconnectTask?.cancel()
+                reconnectTask = nil
+                scheduleReconnect(reason: String(localized: "Связь потеряна"))
+            default: break
+            }
+        }
+        startDiscovery()
     }
 
     // MARK: - Входящие
@@ -262,8 +334,11 @@ final class RadioManager {
     private func handle(_ event: ConnectionEvent) async {
         switch event {
         case .data(let fromRadio):
+            lastReceived = Date()
             handle(fromRadio)
-        case .logMessage, .rssiUpdate:
+        case .logMessage:
+            lastReceived = Date()
+        case .rssiUpdate:
             break
         case .error(let error):
             await teardown()
