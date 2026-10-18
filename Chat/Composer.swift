@@ -11,6 +11,10 @@ struct Composer: View {
     @State private var isSending = false
     @State private var error: String?
     @FocusState private var focused: Bool
+    @AppStorage("glyphZipLevel") private var zipLevel = 0
+
+    /// Что реально уйдёт в эфир.
+    private var outgoing: String { GlyphZip.apply(text, level: zipLevel) }
 
     /// Лимит полезной нагрузки текстового пакета Meshtastic.
     private let maxBytes = 200
@@ -39,7 +43,22 @@ struct Composer: View {
                     .background(.fill.tertiary, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                     .disabled(!isEnabled)
 
-                let bytes = text.utf8.count
+                let bytes = outgoing.utf8.count
+                Button {
+                    zipLevel = (zipLevel + 1) % (GlyphZip.levels.upperBound + 1)
+                } label: {
+                    let tint = GlyphZip.color(zipLevel)
+                    Text("ZIP")
+                        .font(.caption.weight(.bold))
+                        .padding(.horizontal, 8)
+                        .frame(height: 32)
+                        .foregroundStyle(tint)
+                        .background(tint.opacity(0.18), in: Capsule())
+                        .overlay(Capsule().strokeBorder(tint.opacity(0.6), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(GlyphZip.hint(zipLevel))
+
                 Button(action: send) {
                     if isSending {
                         ProgressView().frame(width: 32, height: 32)
@@ -50,11 +69,8 @@ struct Composer: View {
                 .disabled(!isEnabled || isSending || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || bytes > maxBytes)
                 .accessibilityLabel("Отправить")
             }
-            if text.utf8.count > maxBytes * 3 / 4 {
-                Text("\(text.utf8.count)/\(maxBytes) байт")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(text.utf8.count > maxBytes ? .red : .secondary)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
+            if !text.isEmpty {
+                byteCounter
             }
         }
         .padding(.horizontal)
@@ -71,8 +87,26 @@ struct Composer: View {
         .background(.bar)
     }
 
+    /// Счётчик байт как в AppMeshastic: остаток, сэкономлено, полоска заполнения.
+    private var byteCounter: some View {
+        let bytes = outgoing.utf8.count
+        let saved = text.utf8.count - bytes
+        let ratio = Double(bytes) / Double(maxBytes)
+        let color: Color = ratio >= 1 ? .red : ratio >= 0.85 ? .orange : ratio >= 0.65 ? .yellow : .secondary
+        return HStack(spacing: 8) {
+            Text(bytes > maxBytes ? "Превышено на \(bytes - maxBytes) байт" : "Осталось \(maxBytes - bytes) байт")
+                .foregroundStyle(color)
+            if zipLevel > 0, saved > 0 {
+                Text("−\(saved) байт").foregroundStyle(.green)
+            }
+            ProgressView(value: min(ratio, 1))
+                .tint(color == .secondary ? .accentColor : color)
+        }
+        .font(.caption2.monospacedDigit())
+    }
+
     private func send() {
-        let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let message = outgoing.trimmingCharacters(in: .whitespacesAndNewlines)
         isSending = true
         error = nil
         Task {
