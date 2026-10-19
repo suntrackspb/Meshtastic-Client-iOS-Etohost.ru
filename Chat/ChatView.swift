@@ -6,6 +6,9 @@ struct ChatView: View {
     @Environment(RadioManager.self) private var radio
     @State private var selected: MeshChannel?
     @State private var relayMap: RelayMapTarget?
+    /// Карточка ноды отправителя, открытая из сообщения.
+    @State private var nodeCard: String?
+    @Environment(AppRouter.self) private var router
     @State private var replyTo: (id: Int64, preview: String)?
     /// Вкладка «Чат» на экране (TabView держит view живой и на других вкладках).
     @State private var isVisible = false
@@ -18,9 +21,11 @@ struct ChatView: View {
         selected.flatMap { s in channels.first { $0 == s } } ?? channels[0]
     }
 
-    static let quickReactions = ["👍", "❤️", "😂", "🔥", "💯", "👀"]
+    /// Сообщение, для которого выбирается произвольная реакция.
+    @State private var reactionTarget: ReactionTarget?
 
     private func react(_ emoji: String, to packetId: Int64, in channel: RadioManager.RadioChannel) {
+        ReactionUsage.record(emoji)
         Task { try? await radio.sendChannelMessage(emoji, channel: channel, replyTo: packetId, isEmoji: true) }
     }
 
@@ -44,29 +49,18 @@ struct ChatView: View {
                             .font(.footnote)
                             .padding(.vertical, 4)
                         }
-                        ForEach(items) { message in
+                        ForEach(Array(items.enumerated()), id: \.element.id) { index, message in
+                            if items.startsNewDay(at: index, date: \.date) {
+                                DaySeparator(date: message.date)
+                            }
                             MessageRow(message: message,
                                        replyTo: message.replyToPacketId.flatMap(chat.message(packetId:)),
                                        isMine: message.isOutgoing || message.fromId == radio.myNodeId ?? UserDefaults.myNodeId,
                                        reactions: message.packetId.map(chat.reactions(to:)) ?? [],
-                                       onShowRelays: { relayMap = RelayMapTarget(id: $0) })
+                                       onShowRelays: { relayMap = RelayMapTarget(id: $0) },
+                                       onOpenNode: { nodeCard = $0 })
                                 .id(message.id)
-                                .contextMenu {
-                                    if let packetId = message.packetId, radio.isConnected, let radioChannel {
-                                        ControlGroup {
-                                            ForEach(Self.quickReactions, id: \.self) { emoji in
-                                                Button(emoji) { react(emoji, to: packetId, in: radioChannel) }
-                                            }
-                                        }
-                                        .controlGroupStyle(.compactMenu)
-                                        Button("Ответить", systemImage: "arrowshape.turn.up.left") {
-                                            replyTo = (packetId, "\(message.senderShort ?? message.fromId): \(message.text)")
-                                        }
-                                    }
-                                    Button("Копировать", systemImage: "doc.on.doc") {
-                                        UIPasteboard.general.string = message.text
-                                    }
-                                }
+                                .contextMenu { messageMenu(message) }
                         }
                     }
                     .padding(.horizontal)
@@ -112,6 +106,12 @@ struct ChatView: View {
                 }
             }
             .sheet(item: $relayMap) { RelayMapSheet(mirrorId: $0.id) }
+            .sheet(item: $reactionTarget) { target in
+                EmojiPickerSheet { emoji in
+                    if let radioChannel { react(emoji, to: target.packetId, in: radioChannel) }
+                }
+            }
+            .navigationDestination(item: $nodeCard) { NodeDetailView(nodeId: $0) }
             .navigationTitle(channel.name)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -125,6 +125,69 @@ struct ChatView: View {
                 }
             }
         }
+    }
+}
+
+extension ChatView {
+    /// Контекстное меню сообщения: реакции, ответ, отправитель, копирование.
+    @ViewBuilder func messageMenu(_ message: ChatMessage) -> some View {
+        let isMine = message.isOutgoing || message.fromId == radio.myNodeId ?? UserDefaults.myNodeId
+        let sender = message.senderLong ?? message.senderShort ?? message.fromId
+
+        if let packetId = message.packetId, radio.isConnected, let radioChannel {
+            ControlGroup {
+                ForEach(ReactionUsage.top(), id: \.self) { emoji in
+                    Button { react(emoji, to: packetId, in: radioChannel) } label: { Text(emoji) }
+                }
+                Button { reactionTarget = ReactionTarget(packetId: packetId) } label: {
+                    Image(systemName: "face.smiling")
+                }
+                .accessibilityLabel("Другая реакция")
+            }
+            .controlGroupStyle(.palette)
+            Button("Ответить", systemImage: "arrowshape.turn.up.left") {
+                replyTo = (packetId, "\(message.senderShort ?? message.fromId): \(message.text)")
+            }
+        }
+
+        Section(isMine ? "Моя нода" : sender) {
+            Button("Карточка ноды", systemImage: "person.crop.circle") { nodeCard = message.fromId }
+            if !isMine, let num = NodeID.num(message.fromId) {
+                Button("Написать лично", systemImage: "envelope") { router.openConversation(with: num) }
+            }
+            if message.relayCount > 0, let mirrorId = message.mirrorId {
+                Button("Шлюзы на карте (\(message.relayCount))", systemImage: "map") {
+                    relayMap = RelayMapTarget(id: mirrorId)
+                }
+            }
+        }
+
+        Section {
+            Button("Копировать текст", systemImage: "doc.on.doc") {
+                UIPasteboard.general.string = message.text
+            }
+            Button("Копировать ID отправителя", systemImage: "number") {
+                UIPasteboard.general.string = message.fromId
+            }
+            ShareLink(item: "\(sender): \(message.text)") {
+                Label("Поделиться", systemImage: "square.and.arrow.up")
+            }
+        }
+
+        Section(messageInfo(message)) {}
+    }
+
+    /// Строка-сводка внизу меню: время, источник, хопы, SNR.
+    private func messageInfo(_ message: ChatMessage) -> String {
+        var parts = [message.date.formatted(.dateTime.day().month().hour().minute())]
+        if message.sources.contains(.radio) {
+            parts.append("RX")
+            if let hops = message.hops { parts.append(hops == 0 ? "напрямую" : "\(hops) хоп") }
+            if let snr = message.snr { parts.append(String(format: "SNR %.1f", snr)) }
+        } else {
+            parts.append("MQTT")
+        }
+        return parts.joined(separator: " · ")
     }
 }
 

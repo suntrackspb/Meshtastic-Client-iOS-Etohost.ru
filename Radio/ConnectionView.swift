@@ -10,6 +10,10 @@ struct ConnectionView: View {
             List {
                 Section {
                     CurrentRadioCard()
+                    if radio.isConnected {
+                        ConnectedStats()
+                            .listRowInsets(EdgeInsets(top: 8, leading: 12, bottom: 12, trailing: 12))
+                    }
                 }
 
                 if case .poweredOffStatus = bluetoothHint {
@@ -161,6 +165,36 @@ private struct CurrentRadioCard: View {
         case .failed(let reason), .reconnecting(let reason, _): reason
         case .disconnected: "Выберите ноду ниже"
         default: "Получаем NodeDB и каналы"
+        }
+    }
+}
+
+/// Короткая сводка по подключённой ноде.
+private struct ConnectedStats: View {
+    @Environment(RadioManager.self) private var radio
+    @Environment(NodesStore.self) private var nodes
+
+    var body: some View {
+        let radioNodes = nodes.nodes.values.filter { $0.sources.contains(.radio) }
+        let online = radioNodes.filter(\.isOnline).count
+        let me = radio.myNodeId.flatMap { nodes.nodes[$0] }
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 90), spacing: 8)], spacing: 8) {
+            StatTile(value: "\(radioNodes.count)", title: "Нод в эфире", systemImage: "antenna.radiowaves.left.and.right", tint: .teal)
+            StatTile(value: "\(online)", title: "Онлайн", systemImage: "circle.fill", tint: .green)
+            StatTile(value: "\(radio.channels.count)", title: "Каналов", systemImage: "number", tint: .blue)
+            if let battery = me?.batteryLevel {
+                StatTile(value: battery > 100 ? "Сеть" : "\(battery)%", title: "Батарея",
+                         systemImage: battery > 100 ? "powerplug.fill" : "battery.75percent",
+                         tint: battery <= 20 ? .red : .green)
+            }
+            if let util = me?.channelUtilization {
+                StatTile(value: String(format: "%.1f%%", util), title: "Загрузка канала",
+                         systemImage: "waveform.path.ecg", tint: util > 25 ? .orange : .purple)
+            }
+            if let air = me?.airUtilTx {
+                StatTile(value: String(format: "%.1f%%", air), title: "Эфир TX",
+                         systemImage: "arrow.up.circle", tint: .indigo)
+            }
         }
     }
 }

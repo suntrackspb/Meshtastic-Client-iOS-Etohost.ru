@@ -57,6 +57,9 @@ private struct ConversationRow: View {
     var body: some View {
         HStack(spacing: 12) {
             NodeAvatar(nodeId: NodeID.string(conversation.peer), shortName: node?.shortName, size: 46)
+                .overlay(alignment: .bottomTrailing) {
+                    if let node { OnlineDot(isOnline: node.isOnline) }
+                }
             VStack(alignment: .leading, spacing: 3) {
                 HStack {
                     Text(node?.displayName ?? NodeID.string(conversation.peer))
@@ -101,7 +104,10 @@ struct ConversationView: View {
         let thread = direct.thread(with: peer)
         ScrollView {
             LazyVStack(spacing: 6) {
-                ForEach(thread) { message in
+                ForEach(Array(thread.enumerated()), id: \.element.id) { index, message in
+                    if thread.startsNewDay(at: index, date: \.date) {
+                        DaySeparator(date: message.date)
+                    }
                     DirectBubble(message: message,
                                  replyTo: message.replyTo.flatMap { r in thread.first { Int64($0.packetId) == r } })
                         .id(message.id)

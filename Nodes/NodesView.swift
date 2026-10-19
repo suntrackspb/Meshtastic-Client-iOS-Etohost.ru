@@ -10,7 +10,13 @@ struct NodesView: View {
     var body: some View {
         NavigationStack {
             let items = filter.apply(to: store.nodes.values, search: search)
-            List(items) { node in
+            List {
+                if !store.nodes.isEmpty {
+                    NodesSummary(nodes: store.nodes.values, filter: $filter)
+                        .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 8, trailing: 0))
+                        .listRowSeparator(.hidden)
+                }
+                ForEach(items) { node in
                 NavigationLink {
                     NodeDetailView(nodeId: node.id)
                 } label: {
@@ -28,6 +34,7 @@ struct NodesView: View {
                         }
                         Button("Копировать ID", systemImage: "doc.on.doc") { UIPasteboard.general.string = node.id }
                     }
+                }
             }
             .listStyle(.plain)
             .overlay {
@@ -36,7 +43,12 @@ struct NodesView: View {
                 } else if let error = store.lastError {
                     ContentUnavailableView("Нет данных", systemImage: "wifi.slash", description: Text(error))
                 } else if items.isEmpty {
-                    ContentUnavailableView.search(text: search)
+                    if search.isEmpty {
+                        ContentUnavailableView("Нет нод", systemImage: "line.3.horizontal.decrease.circle",
+                                               description: Text("Под фильтры ничего не подходит"))
+                    } else {
+                        ContentUnavailableView.search(text: search)
+                    }
                 }
             }
             .refreshable { await store.refreshFromMirror() }
@@ -75,6 +87,7 @@ private struct NodeRow: View {
     var body: some View {
         HStack(spacing: 12) {
             NodeAvatar(nodeId: node.id, shortName: node.shortName, size: 44)
+                .overlay(alignment: .bottomTrailing) { OnlineDot(isOnline: node.isOnline) }
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 4) {
                     Text(node.displayName).font(.headline).lineLimit(1)
@@ -101,6 +114,7 @@ private struct NodeRow: View {
                 HStack(spacing: 8) {
                     if let heard = node.lastHeard {
                         Text(heard, format: .relative(presentation: .named))
+                            .foregroundStyle(node.isOnline ? AnyShapeStyle(.green) : AnyShapeStyle(.secondary))
                     }
                     if let hops = node.hopsAway {
                         Label(hops == 0 ? "напрямую" : "\(hops) хоп", systemImage: "arrow.triangle.branch")
@@ -108,8 +122,11 @@ private struct NodeRow: View {
                     if node.hasPosition {
                         Image(systemName: "mappin.and.ellipse")
                     }
+                    if let snr = node.snr {
+                        SNRBadge(snr: snr)
+                    }
                     if let battery = node.batteryLevel {
-                        Label("\(min(battery, 100))%", systemImage: "battery.75percent")
+                        BatteryBadge(level: battery)
                     }
                 }
                 .font(.caption2)
@@ -128,6 +145,60 @@ private struct NodeRow: View {
             .font(.caption)
         }
         .padding(.vertical, 2)
+    }
+}
+
+/// Сводка по всем нодам; плитки работают как быстрые фильтры.
+private struct NodesSummary: View {
+    let nodes: Dictionary<String, MeshNode>.Values
+    @Binding var filter: NodeFilter
+
+    var body: some View {
+        let online = nodes.filter(\.isOnline).count
+        let radio = nodes.filter { $0.sources.contains(.radio) }.count
+        let direct = nodes.filter { $0.hopsAway == 0 && $0.sources.contains(.radio) }.count
+        let favorites = nodes.filter(\.isFavorite).count
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                tile("\(nodes.count)", "Всего", "circle.grid.3x3.fill", .blue,
+                     active: filter.lastHeard == .any && filter.source == .all) {
+                    filter.lastHeard = .any
+                    filter.source = .all
+                }
+                tile("\(online)", "Онлайн", "circle.fill", .green,
+                     active: filter.lastHeard == .twoHours) {
+                    filter.lastHeard = filter.lastHeard == .twoHours ? .day : .twoHours
+                }
+                tile("\(radio)", "В эфире", "dot.radiowaves.up.forward", .teal,
+                     active: filter.source == .radio) {
+                    filter.source = filter.source == .radio ? .all : .radio
+                }
+                tile("\(direct)", "Напрямую", "arrow.left.and.right", .orange,
+                     active: filter.maxHops == 0) {
+                    filter.maxHops = filter.maxHops == 0 ? nil : 0
+                }
+                tile("\(favorites)", "Избранные", "star.fill", .yellow,
+                     active: filter.favoritesOnly) {
+                    filter.favoritesOnly.toggle()
+                }
+            }
+            .padding(.horizontal)
+        }
+        .animation(.snappy, value: filter)
+    }
+
+    private func tile(_ value: String, _ title: LocalizedStringKey, _ symbol: String, _ tint: Color,
+                      active: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            StatTile(value: value, title: title, systemImage: symbol, tint: tint)
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .strokeBorder(active ? tint : .clear, lineWidth: 2)
+                }
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(active ? .isSelected : [])
+        .accessibilityHint("Быстрый фильтр")
     }
 }
 

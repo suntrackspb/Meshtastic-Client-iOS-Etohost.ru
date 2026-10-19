@@ -37,7 +37,37 @@ struct ChatMessage: Identifiable, Codable {
 @Observable
 final class ChatStore {
     private(set) var messages: [String: ChatMessage] = [:] {
-        didSet { scheduleSave() }
+        didSet {
+            cachedIndex = nil
+            scheduleSave()
+        }
+    }
+
+    /// Производные индексы ленты. Без них каждая строка чата делала полный проход
+    /// по всем сообщениям (ответ, реакции), и прокрутка становилась O(n²).
+    private struct Index {
+        var byChannel: [String: [ChatMessage]] = [:]
+        var byPacketId: [Int64: ChatMessage] = [:]
+        var reactions: [Int64: [ChatMessage]] = [:]
+    }
+    @ObservationIgnored private var cachedIndex: Index?
+
+    private var index: Index {
+        _ = messages // регистрируем зависимость для Observation
+        if let cachedIndex { return cachedIndex }
+        var idx = Index()
+        let sorted = messages.values.sorted { $0.date < $1.date }
+        for m in sorted {
+            if let p = m.packetId, idx.byPacketId[p] == nil { idx.byPacketId[p] = m }
+            if m.isReaction, let target = m.replyToPacketId { idx.reactions[target, default: []].append(m) }
+        }
+        for m in sorted {
+            // Реакции на загруженные сообщения не показываются отдельно.
+            if m.isReaction, let target = m.replyToPacketId, idx.byPacketId[target] != nil { continue }
+            idx.byChannel[m.channel.lowercased(), default: []].append(m)
+        }
+        cachedIndex = idx
+        return idx
     }
     private(set) var isLoadingHistory = false
     private var mirrorIdToKey: [Int: String] = [:]
@@ -108,8 +138,8 @@ final class ChatStore {
     /// Канал, который ещё ни разу не открывали, считается прочитанным до текущего запуска.
     func unreadCount(in channel: MeshChannel, myNodeId: String?) -> Int {
         let since = lastRead[channel.id] ?? Self.launchDate
-        return messages.values.reduce(0) { count, m in
-            let counts = m.channel.lowercased() == channel.id && m.date > since
+        return messages(in: channel).reduce(0) { count, m in
+            let counts = m.date > since
                 && !m.isReaction && !m.isOutgoing && m.fromId != myNodeId
             return count + (counts ? 1 : 0)
         }
@@ -152,11 +182,7 @@ final class ChatStore {
     /// Сообщения канала по возрастанию времени. Реакции на загруженные сообщения
     /// не показываются отдельно — они собраны в `reactions(to:)`.
     func messages(in channel: MeshChannel) -> [ChatMessage] {
-        let loadedPacketIds = Set(messages.values.compactMap(\.packetId))
-        return messages.values
-            .filter { $0.channel.lowercased() == channel.id }
-            .filter { m in !(m.isReaction && m.replyToPacketId.map(loadedPacketIds.contains) == true) }
-            .sorted { $0.date < $1.date }
+        index.byChannel[channel.id] ?? []
     }
 
     struct ReactionGroup: Identifiable {
@@ -175,9 +201,7 @@ final class ChatStore {
 
     /// Реакции на сообщение, сгруппированные по эмодзи (в порядке первой реакции).
     func reactions(to packetId: Int64) -> [ReactionGroup] {
-        let list = messages.values
-            .filter { $0.isReaction && $0.replyToPacketId == packetId }
-            .sorted { $0.date < $1.date }
+        let list = index.reactions[packetId] ?? []
         var order: [String] = []
         var senders: [String: [ReactionGroup.Sender]] = [:]
         for r in list {
@@ -255,6 +279,6 @@ final class ChatStore {
     }
 
     func message(packetId: Int64) -> ChatMessage? {
-        messages.values.first { $0.packetId == packetId }
+        index.byPacketId[packetId]
     }
 }

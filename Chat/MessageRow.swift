@@ -7,21 +7,29 @@ struct MessageRow: View {
     var isMine = false
     var reactions: [ChatStore.ReactionGroup] = []
     var onShowRelays: (Int) -> Void = { _ in }
+    var onOpenNode: (String) -> Void = { _ in }
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             if isMine {
                 Spacer(minLength: 50)
             } else {
-                NodeAvatar(nodeId: message.fromId, shortName: message.senderShort, size: 36)
+                Button { onOpenNode(message.fromId) } label: {
+                    NodeAvatar(nodeId: message.fromId, shortName: message.senderShort, size: 36)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Карточка ноды \(message.senderLong ?? message.fromId)")
             }
 
             VStack(alignment: .leading, spacing: 4) {
                 if !isMine {
                     HStack(spacing: 6) {
-                        Text(message.senderLong ?? message.fromId)
-                            .font(.subheadline.weight(.semibold))
-                            .lineLimit(1)
+                        Button { onOpenNode(message.fromId) } label: {
+                            Text(message.senderLong ?? message.fromId)
+                                .font(.subheadline.weight(.semibold))
+                                .lineLimit(1)
+                        }
+                        .buttonStyle(.plain)
                         if message.isBot {
                             Image(systemName: "cpu").font(.caption2).foregroundStyle(.secondary)
                         }
