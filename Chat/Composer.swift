@@ -63,10 +63,19 @@ struct Composer: View {
                     if isSending {
                         ProgressView().frame(width: 32, height: 32)
                     } else {
-                        Image(systemName: "arrow.up.circle.fill").font(.system(size: 32))
+                        // resizable + рамка: у символа со шрифтом есть подстрочный отступ,
+                        // из-за которого при выравнивании по низу кнопка «всплывала» на пару точек.
+                        Image(systemName: "arrow.up.circle.fill")
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 32, height: 32)
+                            .foregroundStyle(canSend ? AnyShapeStyle(.tint) : AnyShapeStyle(.tertiary))
                     }
                 }
-                .disabled(!isEnabled || isSending || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || bytes > maxBytes)
+                // На Mac (Catalyst) стиль по умолчанию — серая плашка вокруг иконки.
+                .buttonStyle(.plain)
+                .keyboardShortcut(.return, modifiers: .command)
+                .disabled(!canSend)
                 .accessibilityLabel("Отправить")
             }
             if !text.isEmpty {
@@ -103,6 +112,10 @@ struct Composer: View {
                 .tint(color == .secondary ? .accentColor : color)
         }
         .font(.caption2.monospacedDigit())
+    }
+
+    private var canSend: Bool {
+        isEnabled && !isSending && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && outgoing.utf8.count <= maxBytes
     }
 
     private func send() {

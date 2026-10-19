@@ -25,6 +25,7 @@ targets:
   EtohostMesh:
     type: application
     platform: iOS
+    supportedDestinations: [iOS, macCatalyst]
     sources:
       - path: App
       - path: Chat

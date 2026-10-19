@@ -1,0 +1,113 @@
+name: Release
+
+# Сборка неподписанного .ipa (для AltStore / Sideloadly) и приложения для Mac (Catalyst)
+# и публикация их в draft-релиз. Запуск: пуш тега v* или вручную из вкладки Actions.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия (например 0.2.0). Пусто — из project.yml"
+        required: false
+
+permissions:
+  contents: write
+
+env:
+  SCHEME: EtohostMesh
+  APP_NAME: EtohostMesh
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          elif [[ -n "${{ inputs.version }}" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION=$(grep -m1 'MARKETING_VERSION' project.yml | sed -E 's/.*"(.*)".*/\1/')
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "build=${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION (${GITHUB_RUN_NUMBER})"
+
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Cache SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: build/spm
+          key: spm-${{ hashFiles('project.yml', 'MeshtasticProtobufs/Package.resolved') }}
+
+      - name: Build iOS (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project "$APP_NAME.xcodeproj" -scheme "$SCHEME" -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build/ios -clonedSourcePackagesDirPath build/spm \
+            MARKETING_VERSION="${{ steps.ver.outputs.version }}" \
+            CURRENT_PROJECT_VERSION="${{ steps.ver.outputs.build }}" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            | tail -n 30
+
+      - name: Package .ipa
+        run: |
+          mkdir -p dist/Payload
+          cp -R "build/ios/Build/Products/Release-iphoneos/$APP_NAME.app" dist/Payload/
+          (cd dist && zip -qry "$APP_NAME-${{ steps.ver.outputs.version }}-unsigned.ipa" Payload)
+          rm -rf dist/Payload
+
+      - name: Build macOS (Mac Catalyst)
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project "$APP_NAME.xcodeproj" -scheme "$SCHEME" -configuration Release \
+            -destination 'generic/platform=macOS,variant=Mac Catalyst' \
+            -derivedDataPath build/mac -clonedSourcePackagesDirPath build/spm \
+            MARKETING_VERSION="${{ steps.ver.outputs.version }}" \
+            CURRENT_PROJECT_VERSION="${{ steps.ver.outputs.build }}" \
+            CODE_SIGN_IDENTITY="-" CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            | tail -n 30
+
+      - name: Package macOS app
+        run: |
+          APP="build/mac/Build/Products/Release-maccatalyst/$APP_NAME.app"
+          # Ad-hoc подпись, чтобы приложение запускалось на Apple Silicon.
+          codesign --force --deep --sign - "$APP"
+          ditto -c -k --keepParent "$APP" "dist/$APP_NAME-${{ steps.ver.outputs.version }}-macOS.zip"
+          ls -lh dist
+
+      - name: Draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.ver.outputs.version) }}
+          name: ${{ env.APP_NAME }} ${{ steps.ver.outputs.version }}
+          files: dist/*
+          body: |
+            ## Установка
+
+            **iPhone / iPad** — `*-unsigned.ipa`
+            Неподписанная сборка. Установите через [AltStore](https://altstore.io) или [Sideloadly](https://sideloadly.io): они подпишут её вашим Apple ID.
+
+            **Mac** — `*-macOS.zip`
+            Распакуйте и перенесите в «Программы». Сборка не нотаризована, поэтому при первом запуске выполните:
+            ```
+            xattr -cr /Applications/EtohostMesh.app
+            ```
+            или откройте через правый клик → «Открыть».

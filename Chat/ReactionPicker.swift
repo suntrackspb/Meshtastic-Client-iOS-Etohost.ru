@@ -114,3 +114,31 @@ final class EmojiTextField: UITextField {
         UITextInputMode.activeInputModes.first { $0.primaryLanguage == "emoji" } ?? super.textInputMode
     }
 }
+
+/// Эмодзи для палитры контекстного меню. На Mac (Catalyst) палитра показывает
+/// только картинки — текстовая подпись пропадает, поэтому рисуем эмодзи в UIImage.
+struct EmojiLabel: View {
+    let emoji: String
+
+    var body: some View {
+        #if targetEnvironment(macCatalyst)
+        Image(uiImage: Self.render(emoji)).renderingMode(.original)
+        #else
+        Text(emoji)
+        #endif
+    }
+
+    private static var cache: [String: UIImage] = [:]
+
+    static func render(_ emoji: String, size: CGFloat = 22) -> UIImage {
+        if let cached = cache[emoji] { return cached }
+        let text = emoji as NSString
+        let attrs: [NSAttributedString.Key: Any] = [.font: UIFont.systemFont(ofSize: size)]
+        let box = text.size(withAttributes: attrs)
+        let image = UIGraphicsImageRenderer(size: box).image { _ in
+            text.draw(at: .zero, withAttributes: attrs)
+        }.withRenderingMode(.alwaysOriginal)
+        cache[emoji] = image
+        return image
+    }
+}

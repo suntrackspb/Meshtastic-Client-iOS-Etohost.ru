@@ -1,12 +1,32 @@
 # EtohostMesh
 
-iOS-клиент Meshtastic, интегрированный с зеркалом сети
+Клиент Meshtastic для iPhone, iPad и Mac, интегрированный с зеркалом сети
 [meshtastic-mqtt-mirror](https://github.com/suntrackspb/meshtastic-mqtt-mirror).
 
 - Подключение к ноде по Bluetooth и Wi-Fi (TCP), MQTT Client Proxy.
 - Общий чат и личные сообщения: эфир от ноды и сообщения с зеркала в одной ленте.
 - Список нод с фильтрами, карточка ноды, traceroute, избранные и игнор.
 - Настройки ноды — те же экраны и подписи, что в официальном клиенте.
+- Работает на Mac (Mac Catalyst) с тем же интерфейсом; подключение к ноде по Wi-Fi проверено, по Bluetooth — пока нет.
+
+## Установка
+
+Готовые сборки — на странице [Releases](https://github.com/suntrackspb/Meshtastic-Client-iOS-Etohost.ru/releases).
+
+**iPhone / iPad** — файл `EtohostMesh-<версия>-unsigned.ipa`. Сборка не подписана:
+установите её через [AltStore](https://altstore.io) или [Sideloadly](https://sideloadly.io),
+они подпишут приложение вашим Apple ID. С бесплатным Apple ID подпись действует 7 дней,
+потом приложение нужно переподписать (AltStore делает это сам).
+
+**Mac** — файл `EtohostMesh-<версия>-macOS.zip`. Распакуйте и перенесите `EtohostMesh.app`
+в «Программы». Сборка не нотаризована, поэтому перед первым запуском выполните:
+
+```sh
+xattr -cr /Applications/EtohostMesh.app
+```
+
+или откройте приложение через правый клик → «Открыть». При первом поиске нод macOS спросит
+доступ к Bluetooth — разрешите.
 
 ## Зеркало
 
@@ -29,7 +49,23 @@ xcodegen
 open EtohostMesh.xcodeproj
 ```
 
-В `project.yml` укажите свой `DEVELOPMENT_TEAM` для подписи.
+В `project.yml` укажите свой `DEVELOPMENT_TEAM` для подписи. Для Mac выберите в Xcode
+destination «My Mac (Mac Catalyst)».
+
+## Релизы
+
+Воркфлоу [`.github/workflows/release.yml`](.github/workflows/release.yml) собирает
+неподписанный `.ipa` и Mac-приложение (ad-hoc подпись) и создаёт **draft**-релиз с обоими файлами.
+
+Запуск:
+- пуш тега — версия берётся из тега:
+  ```sh
+  git tag v0.2.0
+  git push origin v0.2.0
+  ```
+- вручную: Actions → Release → Run workflow (версию можно указать, пусто — из `project.yml`).
+
+Номер сборки — номер запуска воркфлоу. После проверки файлов опубликуйте черновик на странице Releases.
 
 ## Лицензия
 

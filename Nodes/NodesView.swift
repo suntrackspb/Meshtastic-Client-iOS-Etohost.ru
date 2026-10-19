@@ -40,7 +40,7 @@ struct NodesView: View {
             .overlay {
                 if store.isLoading && store.nodes.isEmpty {
                     ProgressView("Загрузка нод…")
-                } else if let error = store.lastError {
+                } else if let error = store.lastError, store.nodes.isEmpty {
                     ContentUnavailableView("Нет данных", systemImage: "wifi.slash", description: Text(error))
                 } else if items.isEmpty {
                     if search.isEmpty {

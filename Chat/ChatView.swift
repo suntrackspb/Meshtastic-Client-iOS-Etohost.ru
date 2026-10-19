@@ -137,7 +137,7 @@ extension ChatView {
         if let packetId = message.packetId, radio.isConnected, let radioChannel {
             ControlGroup {
                 ForEach(ReactionUsage.top(), id: \.self) { emoji in
-                    Button { react(emoji, to: packetId, in: radioChannel) } label: { Text(emoji) }
+                    Button { react(emoji, to: packetId, in: radioChannel) } label: { EmojiLabel(emoji: emoji) }
                 }
                 Button { reactionTarget = ReactionTarget(packetId: packetId) } label: {
                     Image(systemName: "face.smiling")
