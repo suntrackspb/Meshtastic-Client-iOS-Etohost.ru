@@ -431,7 +431,7 @@ final class RadioManager {
             let replyTo = data.replyID == 0 ? nil : Int64(data.replyID)
             if packet.to == myNodeNum {
                 direct.receive(from: packet.from, packetId: packet.id, text: text, replyTo: replyTo, hops: hops,
-                               date: packet.rxTime == 0 ? .now : Date(timeIntervalSince1970: TimeInterval(packet.rxTime)))
+                               date: receiveDate(packet))
             } else {
                 let channelName = channels.first { $0.index == Int(packet.channel) }?.name ?? modemPreset ?? "Primary"
                 let node = nodes.nodes[NodeID.string(packet.from)]
@@ -442,7 +442,7 @@ final class RadioManager {
                     longName: node?.longName,
                     text: text,
                     channel: channelName,
-                    date: packet.rxTime == 0 ? .now : Date(timeIntervalSince1970: TimeInterval(packet.rxTime)),
+                    date: receiveDate(packet),
                     replyTo: replyTo,
                     hops: hops,
                     snr: packet.rxSnr == 0 ? nil : Double(packet.rxSnr),
@@ -787,4 +787,17 @@ struct TraceRouteResult {
     let back: [UInt32]
     let snrBack: [Int32]
     let hasBack: Bool
+}
+
+extension RadioManager {
+    /// Время сообщения из эфира. Живой пакет — время устройства: часы ноды могут
+    /// врать (нет GPS/NTP). Пакеты, которые нода отдаёт при подключении из своей
+    /// очереди, — её `rxTime`, если он правдоподобен (не в будущем и не до 2024 года).
+    func receiveDate(_ packet: MeshPacket) -> Date {
+        let now = Date.now
+        guard !isConnected, packet.rxTime != 0 else { return now }
+        let rx = Date(timeIntervalSince1970: TimeInterval(packet.rxTime))
+        let floor = Date(timeIntervalSince1970: 1_704_067_200) // 2024-01-01
+        return rx > floor && rx <= now ? rx : now
+    }
 }

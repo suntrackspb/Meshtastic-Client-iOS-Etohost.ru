@@ -138,7 +138,7 @@ final class MirrorRealtime {
         guard let event = try? MirrorEvent.decode(data) else { return }
         switch event {
         case .initial(let messages): chat.ingestMirror(messages)
-        case .newMessage(let message): chat.ingestMirror([message])
+        case .newMessage(let message): chat.ingestMirror([message], live: true)
         case .relayUpdate(let id, let relay): chat.applyMirrorRelay(messageId: id, relay: relay)
         case .nodeUpdate(let node): nodes.upsertMirror([node])
         case .other: break

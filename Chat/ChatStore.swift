@@ -15,7 +15,7 @@ struct ChatMessage: Identifiable, Codable {
     var senderLong: String?
     let text: String
     let channel: String
-    let date: Date
+    var date: Date
     let replyToPacketId: Int64?
     var sources: Set<MessageSource>
     var mirrorId: Int?
@@ -226,13 +226,22 @@ final class ChatStore {
         }
     }
 
-    func ingestMirror(_ batch: [MirrorMessage]) {
+    /// `live` — сообщение пришло по WebSocket только что: ставим время устройства.
+    /// История (подгрузка, первичный снимок) — время приёма сервером.
+    func ingestMirror(_ batch: [MirrorMessage], live: Bool = false) {
         for m in batch {
             guard let text = m.text, !text.isEmpty, let channel = m.channel else { continue }
             let key = ChatMessage.key(fromId: m.fromId, packetId: m.packetId, fallback: "mirror#\(m.id)")
             mirrorIdToKey[m.id] = key
 
+            // Время приёма сервером, а не `sentAt`: тот берётся из часов ноды-отправителя,
+            // и если они спешат, сообщение встаёт в ленте ниже более поздних.
+            let receivedDate = live ? Date.now : (MirrorJSON.date(m.receivedAt) ?? MirrorJSON.date(m.sentAt) ?? .now)
+
             if var existing = messages[key] {
+                // Сообщение только из зеркала (в т.ч. сохранённое раньше со временем отправителя) —
+                // выравниваем по времени сервера. Пришедшее по радио оставляем со временем приёма нодой.
+                if !live, existing.sources == [.mirror] { existing.date = receivedDate }
                 existing.sources.insert(.mirror)
                 existing.mirrorId = m.id
                 existing.relayCount = max(existing.relayCount, m.relays?.count ?? 0)
@@ -248,7 +257,7 @@ final class ChatStore {
                     senderLong: m.longName,
                     text: text,
                     channel: channel,
-                    date: MirrorJSON.date(m.sentAt) ?? MirrorJSON.date(m.receivedAt) ?? .now,
+                    date: receivedDate,
                     replyToPacketId: m.replyToPacketId,
                     sources: [.mirror],
                     mirrorId: m.id,
